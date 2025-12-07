@@ -1,6 +1,15 @@
+"""
+SpiralReality Symbolic Trace Captor (STC)
+
+生の生成過程で現れた象徴語トークンにフォーカスし、
+その瞬間の hidden/attention を切り出して象徴 ↔ 潜在の対応を作る装置。
+"""
+
 import argparse
 import json
 import os
+import re
+import hashlib
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -35,6 +44,8 @@ class SymbolicViewer:
         capture_hidden: bool = False,
         capture_attn: bool = False,
         save_states_dir: str = "",
+        model_file: str = "",
+        offline: bool = False,
     ):
         self.device = device
         self.max_new_tokens = max_new_tokens
@@ -43,6 +54,7 @@ class SymbolicViewer:
         self.capture_hidden = capture_hidden
         self.capture_attn = capture_attn
         self.save_states_dir = save_states_dir or ""
+        self.offline = offline
         if self.save_states_dir:
             os.makedirs(self.save_states_dir, exist_ok=True)
 
@@ -65,10 +77,28 @@ class SymbolicViewer:
                 "silence",
             ]
         self.symbolic_words = {w.lower() for w in symbolic_words}
+        self.symbol_pattern = re.compile(
+            "|".join(re.escape(w) for w in self.symbolic_words), re.IGNORECASE
+        )
+
+        if self.offline:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            print("[INFO] HF_HUB_OFFLINE=1 でローカルファイルのみを使用します。")
+
+        state_dict = None
+        if model_file:
+            print(f"[INFO] ローカル state_dict を読み込み: {model_file}")
+            state_dict = torch.load(model_file, map_location="cpu")
 
         print(f"[INFO] モデル読み込み中: {model_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, local_files_only=self.offline
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            state_dict=state_dict,
+            local_files_only=self.offline,
+        )
         self.model.to(self.device)
         self.model.eval()
         print(f"[INFO] モデルを {self.device} に配置しました。")
@@ -85,6 +115,11 @@ class SymbolicViewer:
         """テキストをエンコードして指定デバイスに送る"""
         enc = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         return {k: v.to(self.device) for k, v in enc.items()}
+
+    def _short_hash_text(self, text: str) -> int:
+        """prompt + continuation を安定ハッシュして 10 桁に短縮"""
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return int(digest, 16) % 10**10
 
     def generate_continuation(self, prompt: str):
         """
@@ -152,7 +187,7 @@ class SymbolicViewer:
         for i, (tok, tid) in enumerate(zip(tokens, ids)):
             piece = self.tokenizer.decode([tid])
             norm = piece.strip().lower()
-            is_sym = norm in self.symbolic_words
+            is_sym = bool(self.symbol_pattern.search(piece))
 
             mark = " <=== SYMBOL" if is_sym else ""
             print(
@@ -210,6 +245,8 @@ class SymbolicViewer:
             return
 
         records = []
+        hash_txt = self._short_hash_text(prompt + gen_text)
+
         for tok_idx in indices:
             if tok_idx < 0 or tok_idx >= len(token_infos):
                 print(f"[WARN] index {tok_idx} は範囲外なのでスキップします。")
@@ -238,6 +275,11 @@ class SymbolicViewer:
                 # このトークン用の hidden / attn を切り出して保存
                 state_payload = {}
 
+                state_dir = os.path.join(
+                    self.save_states_dir, f"sample{self.sample_id}"
+                )
+                os.makedirs(state_dir, exist_ok=True)
+
                 if hidden_states is not None:
                     # list[layer] of [seq, dim] -> list[layer] of [dim]
                     state_payload["hidden_states"] = [
@@ -251,8 +293,8 @@ class SymbolicViewer:
                     ]
 
                 state_file = os.path.join(
-                    self.save_states_dir,
-                    f"sample{self.sample_id}_tok{tok_idx}.pt",
+                    state_dir,
+                    f"tok{tok_idx}_{hash_txt}.pt",
                 )
                 try:
                     torch.save(state_payload, state_file)
@@ -275,6 +317,13 @@ class SymbolicViewer:
                 "tags": tags,
                 "note": note,
                 "state_file": state_file,
+                "model_meta": {
+                    "num_layers": len(hidden_states) if hidden_states is not None else None,
+                    "hidden_dim": hidden_states[0].shape[-1]
+                    if hidden_states is not None
+                    else None,
+                    "num_heads": attentions[0].shape[0] if attentions else None,
+                },
             }
             records.append(record)
 
@@ -350,6 +399,17 @@ def parse_args():
         default="",
         help="hidden/attn を .pt として保存するディレクトリ。空なら保存しない。",
     )
+    parser.add_argument(
+        "--model_file",
+        type=str,
+        default="",
+        help="ローカルに保存した model state_dict (.pth) のパス。指定すると from_pretrained の state_dict に適用。",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="HF Hub にアクセスせず、ローカルファイルのみで読み込む (HF_HUB_OFFLINE=1)。",
+    )
     return parser.parse_args()
 
 
@@ -377,6 +437,8 @@ def main():
         capture_hidden=args.capture_hidden,
         capture_attn=args.capture_attn,
         save_states_dir=args.save_states_dir,
+        model_file=args.model_file,
+        offline=args.offline,
     )
 
     print("==============================================")
