@@ -158,14 +158,22 @@ class SymbolicViewer:
                     output_attentions=self.capture_attn,
                 )
             if self.capture_hidden and out.hidden_states is not None:
-                # list[layer] of [seq, dim]
-                hidden_states = [h[0].cpu() for h in out.hidden_states]
+                valid_hidden = [h for h in out.hidden_states if h is not None]
+                if not valid_hidden:
+                    print("[WARN] hidden_states が None でした。config を確認してください。")
+                else:
+                    # list[layer] of [seq, dim]
+                    hidden_states = [h[0].cpu() for h in valid_hidden]
             elif self.capture_hidden:
                 print("[WARN] hidden_states が返されませんでした。config を確認してください。")
 
             if self.capture_attn and out.attentions is not None:
-                # list[layer] of [heads, seq, seq]
-                attentions = [a[0].cpu() for a in out.attentions]
+                valid_attn = [a for a in out.attentions if a is not None]
+                if not valid_attn:
+                    print("[WARN] attentions が None でした。config を確認してください。")
+                else:
+                    # list[layer] of [heads, seq, seq]
+                    attentions = [a[0].cpu() for a in valid_attn]
             elif self.capture_attn:
                 print("[WARN] attentions が返されませんでした。config を確認してください。")
 
