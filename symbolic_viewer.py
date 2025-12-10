@@ -165,8 +165,15 @@ class SymbolicViewer:
                 # list[layer] of [seq, dim]
                 hidden_states = [h[0].cpu() for h in out.hidden_states]
             if self.capture_attn:
-                # list[layer] of [heads, seq, seq]
-                attentions = [a[0].cpu() for a in out.attentions]
+                if out.attentions is None:
+                    print(
+                        "[WARN] モデルが attention を返しませんでした。"
+                        " output_attentions をサポートしていない可能性があります。"
+                    )
+                    attentions = None
+                else:
+                    # list[layer] of [heads, seq, seq]
+                    attentions = [a[0].cpu() for a in out.attentions]
 
         return {
             "full_ids": full_ids.cpu(),
