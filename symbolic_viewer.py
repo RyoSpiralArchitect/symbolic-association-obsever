@@ -3,6 +3,9 @@ SpiralReality Symbolic Trace Captor (STC)
 
 生の生成過程で現れた象徴語トークンにフォーカスし、
 その瞬間の hidden/attention を切り出して象徴 ↔ 潜在の対応を作る装置。
+
+v1.1: token レベルに加えて、文・段落っぽいチャンク（segment）レベルの
+      アノテーションもできるように拡張。
 """
 
 import argparse
@@ -107,7 +110,8 @@ class SymbolicViewer:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.sample_id = 0  # アノテーションごとに増やす
+        # サンプルID（1回の生成につき +1）
+        self.sample_id = 0
 
     # ===== 基本処理 =====
 
@@ -157,25 +161,12 @@ class SymbolicViewer:
                     output_hidden_states=self.capture_hidden,
                     output_attentions=self.capture_attn,
                 )
-            if self.capture_hidden and out.hidden_states is not None:
-                valid_hidden = [h for h in out.hidden_states if h is not None]
-                if not valid_hidden:
-                    print("[WARN] hidden_states が None でした。config を確認してください。")
-                else:
-                    # list[layer] of [seq, dim]
-                    hidden_states = [h[0].cpu() for h in valid_hidden]
-            elif self.capture_hidden:
-                print("[WARN] hidden_states が返されませんでした。config を確認してください。")
-
-            if self.capture_attn and out.attentions is not None:
-                valid_attn = [a for a in out.attentions if a is not None]
-                if not valid_attn:
-                    print("[WARN] attentions が None でした。config を確認してください。")
-                else:
-                    # list[layer] of [heads, seq, seq]
-                    attentions = [a[0].cpu() for a in valid_attn]
-            elif self.capture_attn:
-                print("[WARN] attentions が返されませんでした。config を確認してください。")
+            if self.capture_hidden:
+                # list[layer] of [seq, dim]
+                hidden_states = [h[0].cpu() for h in out.hidden_states]
+            if self.capture_attn:
+                # list[layer] of [heads, seq, seq]
+                attentions = [a[0].cpu() for a in out.attentions]
 
         return {
             "full_ids": full_ids.cpu(),
@@ -190,11 +181,14 @@ class SymbolicViewer:
     def tokenize_and_mark_symbolic_from_ids(self, gen_ids: torch.Tensor):
         """
         生成部分の token IDs から象徴語をマーキングする。
-        戻り値: token_infos (list[dict])
+        同時に、簡易な文/段落セグメントIDも付与する。
+        戻り値: token_infos (list[dict]), segments (dict[segment_id] -> [token_index])
         """
         ids = gen_ids.tolist()
         tokens = self.tokenizer.convert_ids_to_tokens(ids)
         token_infos = []
+        segments = {}
+        segment_id = 0
 
         print("=== Token analysis (generated part) ===")
         for i, (tok, tid) in enumerate(zip(tokens, ids)):
@@ -216,16 +210,26 @@ class SymbolicViewer:
                     "decoded": piece,
                     "normalized": norm,
                     "is_symbolic_seed": is_sym,
+                    "segment_id": segment_id,
                 }
             )
+            segments.setdefault(segment_id, []).append(i)
+
+            # セグメント境界のヒューリスティック：
+            # 改行や文末（. ! ?）で次の segment へ
+            if "\n" in piece:
+                segment_id += 1
+            elif any(punct in piece for punct in [".", "!", "?"]):
+                segment_id += 1
 
         print()
-        return token_infos
+        return token_infos, segments
 
-    # ===== アノテーション周り =====
+    # ===== token アノテーション =====
 
     def interactive_annotation(
         self,
+        sample_id: int,
         prompt: str,
         gen_text: str,
         token_infos,
@@ -235,16 +239,14 @@ class SymbolicViewer:
         attentions,
     ):
         """
-        CLI 上で簡易アノテーション & 必要なら hidden / attn を保存。
+        CLI 上で簡易アノテーション & 必要なら hidden / attn を保存（token単位）。
         - 象徴的だと思うトークンの index をカンマ区切りで入力
-        - タグとメモを聞いて JSONL に保存
-        - hidden/attn が有効なら、そのトークン位置の状態を .pt 保存
         """
-        print("アノテーションしたいトークンの index をカンマ区切りで入力 (例: 5,12,19)")
+        print("トークン単位でアノテーションしたい index をカンマ区切りで入力 (例: 5,12,19)")
         print("Enter でスキップできます。")
-        idx_line = input("indices > ").strip()
+        idx_line = input("token indices > ").strip()
         if idx_line == "":
-            print("[INFO] アノテーションはスキップされました。\n")
+            print("[INFO] token アノテーションはスキップされました。\n")
             return
 
         try:
@@ -287,9 +289,8 @@ class SymbolicViewer:
             if self.save_states_dir and (hidden_states is not None or attentions is not None):
                 # このトークン用の hidden / attn を切り出して保存
                 state_payload = {}
-
                 state_dir = os.path.join(
-                    self.save_states_dir, f"sample{self.sample_id}"
+                    self.save_states_dir, f"sample{sample_id}"
                 )
                 os.makedirs(state_dir, exist_ok=True)
 
@@ -317,7 +318,8 @@ class SymbolicViewer:
                     state_file = None
 
             record = {
-                "sample_id": self.sample_id,
+                "level": "token",
+                "sample_id": sample_id,
                 "prompt": prompt,
                 "generated_text": gen_text,
                 "token_index_in_generation": tok_idx,
@@ -341,7 +343,7 @@ class SymbolicViewer:
             records.append(record)
 
         if not records:
-            print("[INFO] 有効なアノテーションがありませんでした。\n")
+            print("[INFO] 有効な token アノテーションがありませんでした。\n")
             return
 
         # JSONL に追記
@@ -349,11 +351,151 @@ class SymbolicViewer:
             with open(annotations_path, "a", encoding="utf-8") as f:
                 for r in records:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            print(f"[INFO] {len(records)} 件のアノテーションを {annotations_path} に保存しました。\n")
+            print(f"[INFO] {len(records)} 件の token アノテーションを {annotations_path} に保存しました。\n")
         except Exception as e:
             print(f"[ERROR] アノテーション保存中にエラー: {e}\n")
 
-        self.sample_id += 1  # 次のサンプルへ
+    # ===== segment アノテーション =====
+
+    def interactive_span_annotation(
+        self,
+        sample_id: int,
+        prompt: str,
+        gen_text: str,
+        token_infos,
+        segments,
+        annotations_path: str,
+        input_len: int,
+        hidden_states,
+        attentions,
+    ):
+        """
+        文・段落っぽいチャンク（segment）単位のアノテーション。
+        - segment_id ごとにテキストを表示
+        - 選ばれた segment について、属するトークンの hidden/attn を平均して保存
+        """
+        if not segments:
+            print("[INFO] セグメントがありません（空の生成？）。\n")
+            return
+
+        print("=== Segments (sentence/paragraph-ish) ===")
+        for seg_id, idxs in segments.items():
+            seg_text = "".join(token_infos[i]["decoded"] for i in idxs)
+            oneline = seg_text.replace("\n", "\\n")
+            if len(oneline) > 120:
+                oneline = oneline[:117] + "..."
+            print(f"[{seg_id}] {oneline}")
+        print()
+
+        print("セグメント単位でアノテーションしたい ID をカンマ区切りで入力 (例: 0,2)")
+        print("Enter でスキップできます。")
+        idx_line = input("segment ids > ").strip()
+        if idx_line == "":
+            print("[INFO] segment アノテーションはスキップされました。\n")
+            return
+
+        try:
+            seg_ids = [
+                int(x.strip())
+                for x in idx_line.split(",")
+                if x.strip() != ""
+            ]
+        except ValueError:
+            print("[WARN] segment ID のパースに失敗しました。スキップします。\n")
+            return
+
+        records = []
+        hash_txt = self._short_hash_text(prompt + gen_text)
+
+        for seg_id in seg_ids:
+            if seg_id not in segments:
+                print(f"[WARN] segment {seg_id} は存在しません。スキップします。")
+                continue
+
+            idxs = segments[seg_id]
+            seg_text = "".join(token_infos[i]["decoded"] for i in idxs)
+
+            print(f"\nSegment {seg_id}:")
+            print(seg_text)
+            tags_line = input(
+                "タグ (例: mythic,trauma,relationship) > "
+            ).strip()
+            note = input("メモ (このセグメント全体の意味・象徴的雰囲気など) > ").strip()
+
+            tags = [
+                t.strip()
+                for t in tags_line.split(",")
+                if t.strip() != ""
+            ]
+
+            state_file = None
+            if self.save_states_dir and (hidden_states is not None or attentions is not None):
+                state_payload = {}
+                state_dir = os.path.join(
+                    self.save_states_dir, f"sample{sample_id}"
+                )
+                os.makedirs(state_dir, exist_ok=True)
+
+                # セグメントに属する full シーケンスポジションを取得
+                positions = [
+                    input_len + token_infos[i]["index"] for i in idxs
+                ]
+
+                if hidden_states is not None:
+                    # list[layer] of [seq, dim] -> list[layer] of [dim] (セグメント平均)
+                    state_payload["hidden_states_segment_mean"] = [
+                        h[positions].mean(dim=0).clone() for h in hidden_states
+                    ]
+
+                if attentions is not None:
+                    # list[layer] of [heads, seq, seq] -> list[layer] of [heads, seq] (from segment 平均)
+                    state_payload["attentions_from_segment_mean"] = [
+                        a[:, positions, :].mean(dim=1).clone() for a in attentions
+                    ]
+
+                state_file = os.path.join(
+                    state_dir,
+                    f"segment{seg_id}_{hash_txt}.pt",
+                )
+                try:
+                    torch.save(state_payload, state_file)
+                    print(f"[INFO] segment hidden/attn を {state_file} に保存しました。")
+                except Exception as e:
+                    print(f"[WARN] segment hidden/attn 保存に失敗: {e}")
+                    state_file = None
+
+            record = {
+                "level": "segment",
+                "sample_id": sample_id,
+                "segment_id": seg_id,
+                "segment_token_indices": segments[seg_id],
+                "segment_text": seg_text,
+                "prompt": prompt,
+                "generated_text": gen_text,
+                "tags": tags,
+                "note": note,
+                "state_file": state_file,
+                "model_meta": {
+                    "num_layers": len(hidden_states) if hidden_states is not None else None,
+                    "hidden_dim": hidden_states[0].shape[-1]
+                    if hidden_states is not None
+                    else None,
+                    "num_heads": attentions[0].shape[0] if attentions else None,
+                },
+            }
+            records.append(record)
+
+        if not records:
+            print("[INFO] 有効な segment アノテーションがありませんでした。\n")
+            return
+
+        try:
+            with open(annotations_path, "a", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            print(f"[INFO] {len(records)} 件の segment アノテーションを {annotations_path} に保存しました。\n")
+        except Exception as e:
+            print(f"[ERROR] segment アノテーション保存中にエラー: {e}\n")
 
 
 def parse_args():
@@ -423,6 +565,11 @@ def parse_args():
         action="store_true",
         help="HF Hub にアクセスせず、ローカルファイルのみで読み込む (HF_HUB_OFFLINE=1)。",
     )
+    parser.add_argument(
+        "--span_annotation",
+        action="store_true",
+        help="文・段落っぽいセグメント単位でもアノテーションする。",
+    )
     return parser.parse_args()
 
 
@@ -455,7 +602,8 @@ def main():
     )
 
     print("==============================================")
-    print(" SpiralReality Step: 生出力 → 象徴語トークン検出 → hidden/attn 抽出 → アノテーション")
+    print(" SpiralReality STC: 生出力 → 象徴語トークン検出 → hidden/attn 抽出")
+    print(" token / segment アノテーション対応")
     print(" 空行のみで Enter を押すと終了します。")
     print("==============================================\n")
 
@@ -470,9 +618,10 @@ def main():
             print("[INFO] 終了します。")
             break
 
+        sample_id = viewer.sample_id
+
         # 1) 生成 + hidden/attn 抽出
         gen = viewer.generate_continuation(prompt)
-        full_text = gen["full_text"]
         continuation = gen["continuation"]
 
         print("\n=== Prompt ===")
@@ -481,11 +630,12 @@ def main():
         print(continuation)
         print()
 
-        # 2) 生成部分だけを token 分解して象徴語マーク
-        token_infos = viewer.tokenize_and_mark_symbolic_from_ids(gen["gen_ids"])
+        # 2) 生成部分だけを token 分解して象徴語マーク & segment 分割
+        token_infos, segments = viewer.tokenize_and_mark_symbolic_from_ids(gen["gen_ids"])
 
-        # 3) その場でアノテーション (任意、hidden/attn 付き)
+        # 3) token アノテーション (任意)
         viewer.interactive_annotation(
+            sample_id=sample_id,
             prompt=prompt,
             gen_text=continuation,
             token_infos=token_infos,
@@ -495,6 +645,21 @@ def main():
             attentions=gen["attentions"],
         )
 
+        # 4) segment アノテーション (任意、フラグが立っているとき)
+        if args.span_annotation:
+            viewer.interactive_span_annotation(
+                sample_id=sample_id,
+                prompt=prompt,
+                gen_text=continuation,
+                token_infos=token_infos,
+                segments=segments,
+                annotations_path=args.annotations_path,
+                input_len=gen["input_len"],
+                hidden_states=gen["hidden_states"],
+                attentions=gen["attentions"],
+            )
+
+        viewer.sample_id += 1  # 次のサンプルへ
         print("-" * 60 + "\n")
 
 
