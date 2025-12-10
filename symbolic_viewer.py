@@ -165,8 +165,31 @@ class SymbolicViewer:
                 # list[layer] of [seq, dim]
                 hidden_states = [h[0].cpu() for h in out.hidden_states]
             if self.capture_attn:
-                # list[layer] of [heads, seq, seq]
-                attentions = [a[0].cpu() for a in out.attentions]
+                if out.attentions is None:
+                    print(
+                        "[WARN] モデルが attention を返しませんでした。"
+                        " output_attentions をサポートしていない可能性があります。"
+                    )
+                    attentions = None
+                else:
+                    attn_list = []
+                    for layer_idx, a in enumerate(out.attentions):
+                        if a is None:
+                            print(
+                                f"[WARN] attention 出力 (layer {layer_idx}) が None でした。"
+                                " 該当層をスキップします。"
+                            )
+                            continue
+                        attn_list.append(a[0].cpu())
+
+                    if not attn_list:
+                        print("[WARN] 全ての層で attention を取得できませんでした。")
+                        attentions = None
+                    else:
+                        if len(attn_list) != len(out.attentions):
+                            print("[WARN] 一部の層でのみ attention を取得しました。")
+                        # list[layer] of [heads, seq, seq]
+                        attentions = attn_list
 
         return {
             "full_ids": full_ids.cpu(),
