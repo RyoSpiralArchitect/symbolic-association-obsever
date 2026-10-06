@@ -28,24 +28,26 @@ function textWithTarget(text, target) {
   else paragraph.append(document.createTextNode(text.slice(0, index)), element('mark', text.slice(index, index + target.length)), document.createTextNode(text.slice(index + target.length)));
   return paragraph;
 }
+function contextCard(record, side) {
+  const kind = (record.tags || []).find(tag => ['literal','metaphorical','mythical','mythic'].includes(tag)) || '';
+  const card = element('article', undefined, `card ${kind}`);
+  if (side) card.append(element('h3', `${side} / 選択した文脈`, 'context-side'));
+  const head = element('div', undefined, 'card-head');
+  for (const tag of record.tags || []) head.append(element('span', tag, 'tag'));
+  if (!record.tags?.length) head.append(element('span', 'タグはありません', 'muted'));
+  head.append(element('span', `#${record.inspector_id + 1} / ${record.level}`, 'card-id'));
+  card.append(head, textWithTarget(record.generated_text || record.segment_text || '本文は記録されていません', (record.decoded || record.segment_text || '').trim()));
+  card.append(element('p', record.note || 'メモはありません', 'note'));
+  const details = element('details');
+  details.append(element('summary', 'Prompt / 注釈対象'), element('p', record.prompt || 'Prompt not recorded'), element('p', `対象: ${record.decoded || record.segment_text || 'Not recorded'}`));
+  card.append(details);
+  card.append(element('p', dataset.demo ? 'TEXT FIXTURE · NO TOKEN IDS / TENSORS' : (record.level === 'token' ? `token id ${record.token_id ?? '?'} · generated index ${record.token_index_in_generation ?? '?'} · full position ${record.seq_pos_in_full ?? '?'}` : `segment ${record.segment_id ?? '?'} · ${(record.segment_token_indices || []).length} annotated tokens`), 'position'));
+  return card;
+}
 function renderCards() {
   const query = $('word').value.trim().toLocaleLowerCase();
   visible = dataset.records.filter(record => [record.decoded, record.normalized, record.segment_text].some(value => (value || '').toLocaleLowerCase().includes(query)));
-  $('cards').replaceChildren();
-  for (const record of visible) {
-    const kind = (record.tags || []).find(tag => ['literal','metaphorical','mythical','mythic'].includes(tag)) || '';
-    const card = element('article', undefined, `card ${kind}`);
-    const head = element('div', undefined, 'card-head');
-    for (const tag of record.tags || []) head.append(element('span', tag, 'tag'));
-    head.append(element('span', `#${record.inspector_id + 1} / ${record.level}`, 'card-id'));
-    card.append(head, textWithTarget(record.generated_text || record.segment_text || '', (record.decoded || record.segment_text || '').trim()));
-    card.append(element('p', record.note || 'メモはありません', 'note'));
-    const details = element('details');
-    details.append(element('summary', 'Prompt / 注釈対象'), element('p', record.prompt || 'Prompt not recorded'), element('p', `対象: ${record.decoded || record.segment_text || 'Not recorded'}`));
-    card.append(details);
-    card.append(element('p', dataset.demo ? 'TEXT FIXTURE · NO TOKEN IDS / TENSORS' : (record.level === 'token' ? `token id ${record.token_id ?? '?'} · generated index ${record.token_index_in_generation ?? '?'} · full position ${record.seq_pos_in_full ?? '?'}` : `segment ${record.segment_id ?? '?'} · ${(record.segment_token_indices || []).length} annotated tokens`), 'position'));
-    $('cards').append(card);
-  }
+  $('cards').replaceChildren(...visible.map(record => contextCard(record)));
   $('empty').hidden = visible.length > 0;
   const previous = [$('left').value, $('right').value];
   for (const [position, id] of ['left', 'right'].entries()) {
@@ -56,6 +58,14 @@ function renderCards() {
   }
   $('compatible').checked = false;
   refreshComparison();
+}
+function renderSelectedContexts() {
+  const cards = ['left', 'right'].map((id, index) => {
+    const record = visible.find(record => String(record.inspector_id) === String($(id).value));
+    return record ? contextCard(record, index === 0 ? 'A' : 'B') : null;
+  }).filter(Boolean);
+  $('selected-contexts').replaceChildren(...cards);
+  if (!cards.length) $('selected-contexts').append(element('p', '比較する文脈がありません。検索条件を変えて注釈を選んでください。', 'empty'));
 }
 function noData(title, message) {
   const box = element('div', undefined, 'no-data');
@@ -80,6 +90,8 @@ function detail(traceData, side) {
 }
 async function refreshComparison() {
   const version = ++requestVersion;
+  // Text comparison uses annotations directly, independent of tensor I/O or consent.
+  renderSelectedContexts();
   $('details').replaceChildren();
   $('state-badge').textContent = 'NO TENSORS';
   $('compatible').disabled = true;
